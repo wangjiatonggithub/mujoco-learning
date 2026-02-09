@@ -43,12 +43,13 @@ ipython==8.36.0
 jedi==0.19.2
 jinja2==3.1.6
 jupyterlab-urdf==0.4.0
-kdl-parser-jvytee @ file:///home/dar/mujoco-bin/mujoco-learning/scripts/kdl_parser
+# kdl-parser-jvytee @ file:///home/dar/mujoco-bin/mujoco-learning/scripts/kdl_parser
 kiwisolver==1.4.8
 lxml==5.4.0
 markdown==3.8
 markupsafe==3.0.2
-matplotlib==3.10.3
+# matplotlib==3.10.3
+matplotlib==3.10.1
 matplotlib-inline==0.1.7
 meshcat==0.3.2
 mpmath==1.3.0
@@ -108,7 +109,8 @@ pyzmq==26.4.0
 rerun-sdk==0.24.1
 roboticstoolbox-python==1.1.1
 rtb-data==1.0.1
-scipy==1.15.3
+# scipy==1.15.3
+scipy==1.15.2
 setuptools==80.7.1
 shimmy==2.0.0
 six==1.17.0

@@ -66,7 +66,7 @@ function installPinocchio(){
   make install
 }
 
-source ../.venv/bin/activate
+# source ../.venv/bin/activate
 # installEigenpy
 # installCasADi
 installPinocchio

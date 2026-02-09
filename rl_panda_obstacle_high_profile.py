@@ -42,7 +42,14 @@ def delete_flag_file(flag_filename="rl_visu_flag"):
         return False
 
 class PandaObstacleEnv(gym.Env):
-    def __init__(self, visualize: bool = False):
+    def __init__(
+        self,
+        visualize: bool = False,
+        obstacle_type: str = "sphere",
+        obstacle_randomize_pos: bool = True,
+        randomize_init_qpos: bool = False,
+        randomize_goal_pos: bool = True,
+    ):
         super(PandaObstacleEnv, self).__init__()
         if not check_flag_file():
             write_flag_file()
@@ -70,33 +77,51 @@ class PandaObstacleEnv(gym.Env):
         self.home_joint_pos = np.array(self.model.key_qpos[0][:7], dtype=np.float32)
         
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
-        # 7轴关节角度、目标位置、障碍物位置和球体直径
-        self.obs_size = 7 + 3 + 3 + 1
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_size,), dtype=np.float32)
         
         # self.goal_position = np.array([0.4, 0.3, 0.4], dtype=np.float32)
-        self.goal_position = np.array([0.4, -0.3, 0.4], dtype=np.float32)
+        self.goal_position_base = np.array([0.4, 0.6, 0.4], dtype=np.float32)
+        self.goal_position = self.goal_position_base.copy()
         self.goal_arrival_threshold = 0.005
         self.goal_visu_size = 0.02
         self.goal_visu_rgba = [0.1, 0.3, 0.3, 0.8]
 
-        # 在xml中增加障碍物，worldbody 中添加如下
-        # <geom name="obstacle_0" 
-        #     type="sphere" 
-        #     size="0.060" 
-        #     pos="0.300 0.200 0.500" 
-        #     contype="1" 
-        #     conaffinity="1" 
-        #     mass="0.0" 
-        #     rgba="0.300 0.300 0.300 0.800" 
-        # />
-        # 并在init函数中初始化障碍物的位置和大小   
+        self.randomize_init_qpos = randomize_init_qpos
+        self.randomize_goal_pos = randomize_goal_pos
+
+        # 可选障碍物类型: sphere | box | cylinder
+        self.obstacle_type = obstacle_type
+        self.obstacle_randomize_pos = obstacle_randomize_pos
+        self.obstacle_geom_names = {
+            "sphere": ["obstacle_sphere"],
+            "box": ["obstacle_u_left", "obstacle_u_right", "obstacle_u_base"],
+            "cylinder": ["obstacle_cylinder"],
+        }
+        if self.obstacle_type not in self.obstacle_geom_names:
+            raise ValueError(f"Unsupported obstacle_type: {self.obstacle_type}")
+
+        self.obstacle_geom_ids = {}
+        self.obstacle_geom_rgba = {}
+        all_obstacle_names = set(sum(self.obstacle_geom_names.values(), []))
         for i in range(self.model.ngeom):
             name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, i)
-            if name == "obstacle_0":
-                self.obstacle_id_1 = i 
-        self.obstacle_position = np.array(self.model.geom_pos[self.obstacle_id_1], dtype=np.float32)
-        self.obstacle_size = self.model.geom_size[self.obstacle_id_1][0]
+            if name in all_obstacle_names:
+                self.obstacle_geom_ids[name] = i
+                self.obstacle_geom_rgba[name] = self.model.geom_rgba[i].copy()
+
+        active_names = self.obstacle_geom_names[self.obstacle_type]
+        missing = [n for n in active_names if n not in self.obstacle_geom_ids]
+        if missing:
+            raise ValueError(f"Obstacle geom(s) not found in model: {missing}")
+        self.obstacle_ids = [self.obstacle_geom_ids[n] for n in active_names]
+        self.obstacle_id_1 = self.obstacle_ids[0]
+        self._set_active_obstacle(active_names)
+
+        self.obstacle_position = self._get_obstacle_center()
+        self.obstacle_size = self._get_obstacle_size_obs()
+
+        # 7轴关节角度、目标位置、障碍物位置和障碍物尺寸
+        self.obs_size = 7 + 3 + 3 + self.obstacle_size.shape[0]
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_size,), dtype=np.float32)
 
         self.last_action = self.home_joint_pos
 
@@ -123,25 +148,93 @@ class PandaObstacleEnv(gym.Env):
         
         # 重置关节到home位姿
         mujoco.mj_resetData(self.model, self.data)
-        self.data.qpos[:7] = self.home_joint_pos
+        if self.randomize_init_qpos:
+            joint_ranges = self.model.jnt_range[:7]
+            self.data.qpos[:7] = self.np_random.uniform(joint_ranges[:, 0], joint_ranges[:, 1]).astype(np.float32)
+        else:
+            self.data.qpos[:7] = self.home_joint_pos
         self.data.qpos[7:] = [0.04,0.04]
         mujoco.mj_forward(self.model, self.data)
 
-        self.goal_position = np.array([self.goal_position[0], self.np_random.uniform(-0.3, 0.3), self.goal_position[2]], dtype=np.float32)
-        self.obstacle_position = np.array([self.obstacle_position[0], self.np_random.uniform(-0.3, 0.3), self.obstacle_position[2]], dtype=np.float32)
-        self.model.geom_pos[self.obstacle_id_1] = self.obstacle_position
+        if self.randomize_goal_pos:
+            self.goal_position = np.array([
+                self.goal_position_base[0],
+                self.np_random.uniform(-0.3, 0.3),
+                self.goal_position_base[2]
+            ], dtype=np.float32)
+        else:
+            self.goal_position = self.goal_position_base.copy()
+        if self.obstacle_randomize_pos:
+            new_position = np.array([
+                self.obstacle_position[0],
+                self.np_random.uniform(-0.3, 0.3),
+                self.obstacle_position[2]
+            ], dtype=np.float32)
+            delta = new_position - self.obstacle_position
+            for geom_id in self.obstacle_ids:
+                self.model.geom_pos[geom_id] = self.model.geom_pos[geom_id] + delta
+            self.obstacle_position = new_position
+        else:
+            self.obstacle_position = self._get_obstacle_center()
         mujoco.mj_step(self.model, self.data)
         
         if self.visualize:
             self._render_scene()
         
+        self.last_action = self.data.qpos[:7].copy()
         obs = self._get_observation()
         self.start_t = time.time()
         return obs, {}
 
     def _get_observation(self) -> np.ndarray:
         joint_pos = self.data.qpos[:7].copy().astype(np.float32)
-        return np.concatenate([joint_pos, self.goal_position, self.obstacle_position + np.random.normal(0, 0.001, size=3), np.array([self.obstacle_size], dtype=np.float32)])
+        self.obstacle_size = self._get_obstacle_size_obs()
+        return np.concatenate([
+            joint_pos,
+            self.goal_position,
+            self.obstacle_position + np.random.normal(0, 0.001, size=3),
+            self.obstacle_size
+        ])
+
+    def _get_obstacle_size_obs(self) -> np.ndarray:
+        if self.obstacle_type == "sphere":
+            return np.array([self.model.geom_size[self.obstacle_id_1][0]], dtype=np.float32)
+        if self.obstacle_type == "box":
+            min_xyz, max_xyz = self._get_obstacle_aabb()
+            return ((max_xyz - min_xyz) / 2.0).astype(np.float32)
+        if self.obstacle_type == "cylinder":
+            return self.model.geom_size[self.obstacle_id_1][:2].astype(np.float32)
+        return np.array([self.model.geom_size[self.obstacle_id_1][0]], dtype=np.float32)
+
+    def _set_active_obstacle(self, active_names: list[str]) -> None:
+        active_set = set(active_names)
+        for name, geom_id in self.obstacle_geom_ids.items():
+            if name in active_set:
+                self.model.geom_conaffinity[geom_id] = 1
+                self.model.geom_contype[geom_id] = 1
+                self.model.geom_rgba[geom_id] = self.obstacle_geom_rgba[name]
+            else:
+                self.model.geom_conaffinity[geom_id] = 0
+                self.model.geom_contype[geom_id] = 0
+                rgba = self.model.geom_rgba[geom_id].copy()
+                rgba[3] = 0.0
+                self.model.geom_rgba[geom_id] = rgba
+
+    def _get_obstacle_aabb(self) -> tuple[np.ndarray, np.ndarray]:
+        min_xyz = np.array([np.inf, np.inf, np.inf], dtype=np.float32)
+        max_xyz = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float32)
+        for geom_id in self.obstacle_ids:
+            pos = self.model.geom_pos[geom_id].astype(np.float32)
+            size = self.model.geom_size[geom_id].astype(np.float32)
+            min_xyz = np.minimum(min_xyz, pos - size)
+            max_xyz = np.maximum(max_xyz, pos + size)
+        return min_xyz, max_xyz
+
+    def _get_obstacle_center(self) -> np.ndarray:
+        if self.obstacle_type == "box":
+            min_xyz, max_xyz = self._get_obstacle_aabb()
+            return ((min_xyz + max_xyz) / 2.0).astype(np.float32)
+        return np.array(self.model.geom_pos[self.obstacle_id_1], dtype=np.float32)
 
     def _calc_reward(self, joint_angles: np.ndarray, action: np.ndarray) -> tuple[np.ndarray, float]:
         now_ee_pos = self.data.body(self.end_effector_id).xpos.copy()
@@ -257,10 +350,20 @@ def train_ppo(
     total_timesteps: int = 80_000_000,
     model_save_path: str = "panda_ppo_reach_target",
     visualize: bool = False,
-    resume_from: Optional[str] = None
+    resume_from: Optional[str] = None,
+    obstacle_type: str = "sphere",
+    obstacle_randomize_pos: bool = True,
+    randomize_init_qpos: bool = False,
+    randomize_goal_pos: bool = True
 ) -> None:
 
-    ENV_KWARGS = {'visualize': visualize}
+    ENV_KWARGS = {
+        'visualize': visualize,
+        'obstacle_type': obstacle_type,
+        'obstacle_randomize_pos': obstacle_randomize_pos,
+        'randomize_init_qpos': randomize_init_qpos,
+        'randomize_goal_pos': randomize_goal_pos
+    }
     
     env = make_vec_env(
         env_id=lambda: PandaObstacleEnv(** ENV_KWARGS),
@@ -321,8 +424,18 @@ def train_ppo(
 def test_ppo(
     model_path: str = "panda_obstacle_avoidance",
     total_episodes: int = 5,
+    obstacle_type: str = "sphere",
+    obstacle_randomize_pos: bool = True,
+    randomize_init_qpos: bool = False,
+    randomize_goal_pos: bool = True,
 ) -> None:
-    env = PandaObstacleEnv(visualize=True)
+    env = PandaObstacleEnv(
+        visualize=True,
+        obstacle_type=obstacle_type,
+        obstacle_randomize_pos=obstacle_randomize_pos,
+        randomize_init_qpos=randomize_init_qpos,
+        randomize_goal_pos=randomize_goal_pos
+    )
     model = PPO.load(model_path, env=env)
 
     
@@ -356,6 +469,10 @@ def test_ppo(
 
 if __name__ == "__main__":
     TRAIN_MODE = True  # 设为True开启训练模式
+    OBSTACLE_TYPE = "box"  # 可选: sphere | box | cylinder
+    OBSTACLE_RANDOMIZE_POS = False  # 是否随机变化障碍物位置
+    RANDOMIZE_INIT_QPOS = False  # 是否随机机械臂初始位姿
+    RANDOMIZE_GOAL_POS = False  # 是否随机目标位姿
     if TRAIN_MODE:
         import os 
         os.system("rm -rf /home/dar/mujoco-bin/mujoco-learning/tensorboard*")
@@ -369,11 +486,19 @@ if __name__ == "__main__":
             model_save_path=MODEL_PATH,
             visualize=True,
             # resume_from=RESUME_MODEL_PATH
-            resume_from=None
+            resume_from=None,
+            obstacle_type=OBSTACLE_TYPE,
+            obstacle_randomize_pos=OBSTACLE_RANDOMIZE_POS,
+            randomize_init_qpos=RANDOMIZE_INIT_QPOS,
+            randomize_goal_pos=RANDOMIZE_GOAL_POS
         )
     else:
         test_ppo(
             model_path=MODEL_PATH,
             total_episodes=100,
+            obstacle_type=OBSTACLE_TYPE,
+            obstacle_randomize_pos=OBSTACLE_RANDOMIZE_POS,
+            randomize_init_qpos=RANDOMIZE_INIT_QPOS,
+            randomize_goal_pos=RANDOMIZE_GOAL_POS,
         )
     os.system("date")

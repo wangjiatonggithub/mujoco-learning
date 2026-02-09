@@ -25,10 +25,50 @@
       <geom name="Z" type="cylinder" size="0.005" fromto="0 0 0 0 0 0.3" rgba="0 0 1 1" contype="0" conaffinity="0" />
     </body>
 
-    <body name="obstacle_0">  
-      <geom name="obstacle_0" 
+    <body name="obstacle_sphere">  
+      <geom name="obstacle_sphere" 
         type="sphere" 
-        size="0.060" 
+        size="0.10" 
+        pos="0.300 -0.100 0.5500" 
+        contype="1" 
+        conaffinity="1" 
+        mass="0.2" 
+        rgba="0.300 0.300 0.300 0.800" 
+      />
+    </body>
+    <body name="obstacle_box">  
+      <geom name="obstacle_u_left" 
+        type="box" 
+        size="0.010 0.080 0.30" 
+        pos="-0.3 0.3 0.300" 
+        contype="1" 
+        conaffinity="1" 
+        mass="0.067" 
+        rgba="0.300 0.300 0.300 0.800" 
+      />
+      <geom name="obstacle_u_right" 
+        type="box" 
+        size="0.010 0.080 0.30" 
+        pos="0.90 0.3 0.300" 
+        contype="1" 
+        conaffinity="1" 
+        mass="0.067" 
+        rgba="0.300 0.300 0.300 0.800" 
+      />
+      <geom name="obstacle_u_base" 
+        type="box" 
+        size="0.60 0.01 0.3" 
+        pos="0.300 0.370 0.300" 
+        contype="1" 
+        conaffinity="1" 
+        mass="0.067" 
+        rgba="0.300 0.300 0.300 0.800" 
+      />
+    </body>
+    <body name="obstacle_cylinder">  
+      <geom name="obstacle_cylinder" 
+        type="cylinder" 
+        size="0.050 0.080" 
         pos="0.300 0.200 0.500" 
         contype="1" 
         conaffinity="1" 
