@@ -25,7 +25,7 @@
       <geom name="Z" type="cylinder" size="0.005" fromto="0 0 0 0 0 0.3" rgba="0 0 1 1" contype="0" conaffinity="0" />
     </body>
 
-    <body name="obstacle_sphere">  
+    <!-- <body name="obstacle_sphere">  
       <geom name="obstacle_sphere" 
         type="sphere" 
         size="0.10" 
@@ -35,7 +35,7 @@
         mass="0.2" 
         rgba="0.300 0.300 0.300 0.800" 
       />
-    </body>
+    </body> -->
     <body name="obstacle_box">  
       <geom name="obstacle_u_left" 
         type="box" 
@@ -65,7 +65,7 @@
         rgba="0.300 0.300 0.300 0.800" 
       />
     </body>
-    <body name="obstacle_cylinder">  
+    <!-- <body name="obstacle_cylinder">  
       <geom name="obstacle_cylinder" 
         type="cylinder" 
         size="0.050 0.080" 
@@ -75,7 +75,7 @@
         mass="0.2" 
         rgba="0.300 0.300 0.300 0.800" 
       />
-    </body>
+    </body> -->
     <!-- <body name="obstacle_1">
       <geom name="obstacle_1" 
         type="sphere" 
