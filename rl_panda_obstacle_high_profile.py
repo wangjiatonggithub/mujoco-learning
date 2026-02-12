@@ -10,9 +10,11 @@ import warnings
 import torch
 import mujoco.viewer
 import time
+import setproctitle
 from typing import Optional
 from scipy.spatial.transform import Rotation as R
 
+setproctitle.setproctitle("python train_myself.py --lr 0.001")
 # 忽略stable-baselines3的冗余UserWarning
 warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines3.common.on_policy_algorithm")
 
@@ -54,7 +56,7 @@ class PandaObstacleEnv(gym.Env):
         goal_min_distance: float = 0.08,
         randomize_goal_pos: bool = True,
         # use_sim_time_for_timeout: bool = False,
-        max_episode_time: float = 20.0,
+        max_episode_time: float = 40, # 20.0
         pause_on_collision: bool = False, # 测试时碰到障碍物就停止，以便清楚展示碰撞情况
         # collision_pause_time: float = 0.8,
         # collision_pause_mode: str = "sleep",
@@ -99,7 +101,7 @@ class PandaObstacleEnv(gym.Env):
         self.last_contact_info = None # 记录碰撞信息
 
         self.proximity_threshold = 0.05 # 近距离惩罚阈值（单位：米）
-        self.proximity_penalty_scale = 2.0 # 近距离惩罚强度
+        self.proximity_penalty_scale = 20.0 # 近距离惩罚强度
 
         self.randomize_init_qpos = randomize_init_qpos
         self.enforce_collision_free_init = enforce_collision_free_init
@@ -144,9 +146,9 @@ class PandaObstacleEnv(gym.Env):
         self.obstacle_group_center = self._get_obstacle_center() # 障碍物整体中心位置（用于随机移动）
         self.obstacle_positions = self._get_obstacle_centers() # 每个障碍物几何体中心位置
         self.obstacle_sizes = self._get_obstacle_sizes_obs() # 每个障碍物几何体尺寸
-        print("self.obstacle_group_center ", self.obstacle_group_center )
-        print("self.obstacle_positions ", self.obstacle_positions )
-        print("self.obstacle_sizes ", self.obstacle_sizes )
+        # print("self.obstacle_group_center ", self.obstacle_group_center )
+        # print("self.obstacle_positions ", self.obstacle_positions )
+        # print("self.obstacle_sizes ", self.obstacle_sizes )
 
         # 7轴关节角度、目标位置、每个障碍物位置和尺寸
         num_obstacles = self.obstacle_positions.shape[0]
@@ -223,7 +225,7 @@ class PandaObstacleEnv(gym.Env):
                 now_ee_pos = self.data.body(self.end_effector_id).xpos.copy()
                 if self.data.ncon == 0 and self._min_distance_to_obstacles(now_ee_pos) >= self.init_min_distance:
                     found = True
-                    print ("yes")
+                    # print ("yes")
                     break
             if not found:
                 warnings.warn("No collision-free init pose found; using home pose.")
@@ -390,11 +392,11 @@ class PandaObstacleEnv(gym.Env):
 
         # 非线性距离奖励
         if dist_to_goal < self.goal_arrival_threshold:
-            distance_reward = 20.0*(1.0+(1.0-(dist_to_goal / self.goal_arrival_threshold)))
+            distance_reward = 100.0*(1.0+(1.0-(dist_to_goal / self.goal_arrival_threshold)))
         elif dist_to_goal < 2*self.goal_arrival_threshold:
-            distance_reward = 10.0*(1.0+(1.0-(dist_to_goal / 2*self.goal_arrival_threshold)))
+            distance_reward = 50.0*(1.0+(1.0-(dist_to_goal / 2*self.goal_arrival_threshold)))
         elif dist_to_goal < 3*self.goal_arrival_threshold:
-            distance_reward = 5.0*(1.0+(1.0-(dist_to_goal / 3*self.goal_arrival_threshold)))
+            distance_reward = 10.0*(1.0+(1.0-(dist_to_goal / 3*self.goal_arrival_threshold)))
         else:
             distance_reward = 1.0 / (1.0 + dist_to_goal)
         
@@ -402,7 +404,7 @@ class PandaObstacleEnv(gym.Env):
         smooth_penalty = 0.001 * np.linalg.norm(action - self.last_action)
 
         # 碰撞惩罚
-        contact_reward = 10.0 * self.data.ncon # 利用接触对数量检测碰撞
+        contact_reward = 100.0 * self.data.ncon # 利用接触对数量检测碰撞
 
         # 近距离惩罚（未接触但过近）
         min_dist = self._min_distance_to_obstacles(now_ee_pos)
@@ -460,10 +462,10 @@ class PandaObstacleEnv(gym.Env):
                 "body1": body1_name,
                 "body2": body2_name,
             }
-            print(
-                f"[碰撞] geom: {geom1_name} vs {geom2_name} | "
-                f"body: {body1_name} vs {body2_name} | pos: {self.last_contact_pos}"
-            )
+            # print(
+            #     f"[碰撞] geom: {geom1_name} vs {geom2_name} | "
+            #     f"body: {body1_name} vs {body2_name} | pos: {self.last_contact_pos}"
+            # )
             if self.visualize and self.pause_on_collision:
                 self._render_scene()
                 self.handle.sync()
@@ -642,7 +644,7 @@ def test_ppo(
             success_count += 1
         print(
             f"轮次 {ep+1:2d} | 总奖励: {episode_reward:6.2f} | 结果: {'成功' if info['is_success'] else '碰撞/失败'} "
-            f"| 碰撞: {info['collision']} | 距离: {info['distance_to_goal']:.4f}"
+            # f"| 碰撞: {info['collision']} | 距离: {info['distance_to_goal']:.4f}"
         )
     
     success_rate = (success_count / total_episodes) * 100
@@ -668,7 +670,7 @@ if __name__ == "__main__":
             n_envs=64,                
             total_timesteps=60_000_000,
             model_save_path=MODEL_PATH,
-            visualize=True,
+            visualize=False,
             # resume_from=RESUME_MODEL_PATH
             resume_from=None,
             obstacle_type=OBSTACLE_TYPE,
