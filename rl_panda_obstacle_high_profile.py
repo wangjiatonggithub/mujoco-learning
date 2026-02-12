@@ -48,7 +48,16 @@ class PandaObstacleEnv(gym.Env):
         obstacle_type: str = "sphere",
         obstacle_randomize_pos: bool = True,
         randomize_init_qpos: bool = False,
+        enforce_collision_free_init: bool = True, # 机械臂初始位姿碰撞检测
+        init_qpos_max_attempts: int = 50,
+        init_min_distance: float = 0.08,
+        goal_min_distance: float = 0.08,
         randomize_goal_pos: bool = True,
+        # use_sim_time_for_timeout: bool = False,
+        max_episode_time: float = 20.0,
+        pause_on_collision: bool = False, # 测试时碰到障碍物就停止，以便清楚展示碰撞情况
+        # collision_pause_time: float = 0.8,
+        # collision_pause_mode: str = "sleep",
     ):
         super(PandaObstacleEnv, self).__init__()
         if not check_flag_file():
@@ -84,12 +93,25 @@ class PandaObstacleEnv(gym.Env):
         self.goal_arrival_threshold = 0.005 # 目标到达阈值，单位为米
         self.goal_visu_size = 0.02 # 目标可视化球尺寸
         self.goal_visu_rgba = [0.1, 0.3, 0.3, 0.8] # 目标可视化球颜色和透明度
+        self.contact_visu_size = 0.012 # 碰撞点可视化球尺寸
+        self.contact_visu_rgba = [1.0, 0.2, 0.2, 0.9] # 碰撞点颜色
+        self.last_contact_pos = None # 记录上一次碰撞位置，用于可视化显示碰撞点
+        self.last_contact_info = None # 记录碰撞信息
 
         self.proximity_threshold = 0.05 # 近距离惩罚阈值（单位：米）
         self.proximity_penalty_scale = 2.0 # 近距离惩罚强度
 
         self.randomize_init_qpos = randomize_init_qpos
+        self.enforce_collision_free_init = enforce_collision_free_init
+        self.init_qpos_max_attempts = init_qpos_max_attempts
+        self.init_min_distance = init_min_distance
+        self.goal_min_distance = goal_min_distance
         self.randomize_goal_pos = randomize_goal_pos
+        # self.use_sim_time_for_timeout = use_sim_time_for_timeout
+        self.max_episode_time = max_episode_time
+        self.pause_on_collision = pause_on_collision
+        # self.collision_pause_time = collision_pause_time
+        # self.collision_pause_mode = collision_pause_mode
 
         # 可选障碍物类型: sphere | box | cylinder
         self.obstacle_type = obstacle_type
@@ -133,15 +155,16 @@ class PandaObstacleEnv(gym.Env):
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_size,), dtype=np.float32)
 
         self.last_action = self.home_joint_pos
+        self.start_sim_time = 0.0
 
-    def _render_scene(self) -> None: # 在可视化窗口中渲染目标位置和障碍物
+    def _render_scene(self) -> None: # 在可视化窗口中渲染目标位置和碰撞发生位置
         if not self.visualize or self.handle is None:
             return
-        self.handle.user_scn.ngeom = 0
-        total_geoms = 1
+        self.handle.user_scn.ngeom = 0 # 把场景中的集几何体数量清零
+        total_geoms = 1 + (1 if self.last_contact_pos is not None else 0) # 目标+碰撞点数量
         self.handle.user_scn.ngeom = total_geoms
 
-        mujoco.mjv_initGeom(
+        mujoco.mjv_initGeom( # 绘制目标点，形状为球形
             self.handle.user_scn.geoms[0],
             mujoco.mjtGeom.mjGEOM_SPHERE,
             size=[self.goal_visu_size, 0.0, 0.0],
@@ -150,22 +173,24 @@ class PandaObstacleEnv(gym.Env):
             rgba=np.array(self.goal_visu_rgba, dtype=np.float32)
         )
 
+        if self.last_contact_pos is not None: # 绘制碰撞位置，形状为球形
+            mujoco.mjv_initGeom(
+                self.handle.user_scn.geoms[1],
+                mujoco.mjtGeom.mjGEOM_SPHERE,
+                size=[self.contact_visu_size, 0.0, 0.0],
+                pos=self.last_contact_pos,
+                mat=np.eye(3).flatten(),
+                rgba=np.array(self.contact_visu_rgba, dtype=np.float32)
+            )
+
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> tuple[np.ndarray, dict]: # 重置环境状态，包括机械臂初始位姿、目标位置和障碍物位置，并返回初始观察
         super().reset(seed=seed)
         if seed is not None:
-            self.np_random = np.random.default_rng(seed)
+            self.np_random = np.random.default_rng(seed) # 初始化随机数生成器
         
-        # 重置关节到home位姿
+        # 重置初始位姿
         mujoco.mj_resetData(self.model, self.data)
-        if self.randomize_init_qpos:
-            joint_ranges = self.model.jnt_range[:7]
-            self.data.qpos[:7] = self.np_random.uniform(joint_ranges[:, 0], joint_ranges[:, 1]).astype(np.float32)
-        else:
-            self.data.qpos[:7] = self.home_joint_pos
-        self.data.qpos[7:] = [0.04,0.04]
-        mujoco.mj_forward(self.model, self.data)
-
-        if self.obstacle_randomize_pos:
+        if self.obstacle_randomize_pos: # 障碍物位置随机初始化
             group_center = self._get_obstacle_center()
             new_center = np.array([
                 self.np_random.uniform(-0.3, 0.3),
@@ -178,20 +203,53 @@ class PandaObstacleEnv(gym.Env):
             self.obstacle_group_center = new_center
         else:
             self.obstacle_group_center = self._get_obstacle_center()
+
+        # 根据障碍物位置选择初始关节角，确保不与障碍物碰撞
+        joint_ranges = self.model.jnt_range[:7] # 获取关节角度范围
+        def _set_qpos_and_forward(qpos: np.ndarray) -> None:
+            self.data.qpos[:7] = qpos.astype(np.float32)
+            self.data.qpos[7:] = [0.04, 0.04] # 设置手指关节固定
+            mujoco.mj_forward(self.model, self.data)
+
+        if self.enforce_collision_free_init:
+            max_attempts = max(1, int(self.init_qpos_max_attempts))
+            found = False
+            for attempt in range(max_attempts):
+                if self.randomize_init_qpos or attempt > 0:
+                    candidate = self.np_random.uniform(joint_ranges[:, 0], joint_ranges[:, 1]).astype(np.float32)
+                else:
+                    candidate = self.home_joint_pos
+                _set_qpos_and_forward(candidate)
+                now_ee_pos = self.data.body(self.end_effector_id).xpos.copy()
+                if self.data.ncon == 0 and self._min_distance_to_obstacles(now_ee_pos) >= self.init_min_distance:
+                    found = True
+                    print ("yes")
+                    break
+            if not found:
+                warnings.warn("No collision-free init pose found; using home pose.")
+                _set_qpos_and_forward(self.home_joint_pos)
+        else:
+            if self.randomize_init_qpos:
+                candidate = self.np_random.uniform(joint_ranges[:, 0], joint_ranges[:, 1]).astype(np.float32)
+            else:
+                candidate = self.home_joint_pos
+            _set_qpos_and_forward(candidate)
+
         mujoco.mj_step(self.model, self.data)
 
         self.obstacle_positions = self._get_obstacle_centers()
         self.obstacle_sizes = self._get_obstacle_sizes_obs()
 
-        if self.randomize_goal_pos:
+        if self.randomize_goal_pos: # 目标点位置随机初始化
             max_attempts = 100
             for _ in range(max_attempts):
                 candidate = np.array([
                     self.np_random.uniform(-0.5, 0.5),
-                    self.np_random.uniform(0.5, 0.7),
+                    self.np_random.uniform(-0.7, 0.7),
                     self.np_random.uniform(0.2, 0.8),
                 ], dtype=np.float32)
-                if not self._is_point_in_any_obstacle(candidate):
+                if (not self._is_point_in_any_obstacle(candidate)
+                        and self._min_distance_to_obstacles(candidate) >= self.goal_min_distance):
                     self.goal_position = candidate
                     break
             else:
@@ -206,13 +264,16 @@ class PandaObstacleEnv(gym.Env):
         self.last_action = self.data.qpos[:7].copy()
         obs = self._get_observation()
         self.start_t = time.time()
+        self.start_sim_time = float(self.data.time)
+        self.last_contact_pos = None
+        self.last_contact_info = None
         return obs, {}
 
-    def _get_observation(self) -> np.ndarray:
+    def _get_observation(self) -> np.ndarray: 
         joint_pos = self.data.qpos[:7].copy().astype(np.float32)
         self.obstacle_positions = self._get_obstacle_centers()
         self.obstacle_sizes = self._get_obstacle_sizes_obs()
-        obstacle_pos_noise = np.random.normal(0, 0.001, size=self.obstacle_positions.shape)
+        obstacle_pos_noise = np.random.normal(0, 0.001, size=self.obstacle_positions.shape) # 障碍物位置再加一个随机扰动
         return np.concatenate([
             joint_pos,
             self.goal_position,
@@ -220,13 +281,13 @@ class PandaObstacleEnv(gym.Env):
             self.obstacle_sizes.flatten()
         ])
 
-    def _get_obstacle_centers(self) -> np.ndarray:
+    def _get_obstacle_centers(self) -> np.ndarray: # 从配置文件中获取障碍物中心
         centers = []
         for geom_id in self.obstacle_ids:
             centers.append(self.model.geom_pos[geom_id].astype(np.float32))
         return np.stack(centers, axis=0)
 
-    def _get_obstacle_sizes_obs(self) -> np.ndarray:
+    def _get_obstacle_sizes_obs(self) -> np.ndarray: # 从配置文件中获取障碍物尺寸
         sizes = []
         if self.obstacle_type == "sphere":
             for geom_id in self.obstacle_ids:
@@ -242,7 +303,7 @@ class PandaObstacleEnv(gym.Env):
                 sizes.append([self.model.geom_size[geom_id][0]])
         return np.array(sizes, dtype=np.float32)
 
-    def _is_point_in_any_obstacle(self, point: np.ndarray) -> bool:
+    def _is_point_in_any_obstacle(self, point: np.ndarray) -> bool: # 判断随机初始化的目标点是否在障碍物内部
         centers = self._get_obstacle_centers()
         sizes = self._get_obstacle_sizes_obs()
         for idx in range(centers.shape[0]):
@@ -267,18 +328,18 @@ class PandaObstacleEnv(gym.Env):
                     return True
         return False
 
-    def _set_active_obstacle(self, active_names: list[str]) -> None:
-        active_set = set(active_names)
+    def _set_active_obstacle(self, active_names: list[str]) -> None: # 只保留指定的环境障碍物进行可视化和考虑碰撞
+        active_set = set(active_names) # 把列表转换为集合
         for name, geom_id in self.obstacle_geom_ids.items():
             if name in active_set:
-                self.model.geom_conaffinity[geom_id] = 1
-                self.model.geom_contype[geom_id] = 1
-                self.model.geom_rgba[geom_id] = self.obstacle_geom_rgba[name]
+                self.model.geom_conaffinity[geom_id] = 1 # 允许接触检测
+                self.model.geom_contype[geom_id] = 1 # 允许碰撞类型匹配
+                self.model.geom_rgba[geom_id] = self.obstacle_geom_rgba[name] # 颜色正常显示
             else:
                 self.model.geom_conaffinity[geom_id] = 0
                 self.model.geom_contype[geom_id] = 0
                 rgba = self.model.geom_rgba[geom_id].copy()
-                rgba[3] = 0.0
+                rgba[3] = 0.0 # 透明度变成0
                 self.model.geom_rgba[geom_id] = rgba
 
     def _get_obstacle_aabb(self) -> tuple[np.ndarray, np.ndarray]:
@@ -358,7 +419,7 @@ class PandaObstacleEnv(gym.Env):
             elif joint_angles[i] > max_angle:
                 joint_penalty += 0.5 * (joint_angles[i] - max_angle)
         
-        time_penalty = 0.001 * (time.time() - self.start_t)
+        time_penalty = 0.001 * (float(self.data.time) - self.start_sim_time)
         
         total_reward = (distance_reward 
                     - contact_reward 
@@ -374,7 +435,7 @@ class PandaObstacleEnv(gym.Env):
     def step(self, action: np.ndarray) -> tuple[np.ndarray, np.float32, bool, bool, dict]:
         joint_ranges = self.model.jnt_range[:7]
         scaled_action = np.zeros(7, dtype=np.float32)
-        for i in range(7):
+        for i in range(7): # 把动作从[-1,1]现行映射到关节真正的物理范围
             scaled_action[i] = joint_ranges[i][0] + (action[i] + 1) * 0.5 * (joint_ranges[i][1] - joint_ranges[i][0])
         
         self.data.ctrl[:7] = scaled_action
@@ -385,23 +446,35 @@ class PandaObstacleEnv(gym.Env):
         terminated = False
 
         if collision:
-            # print("collision happened, ", self.data.ncon)
-            # info = {}
-            # for i in range(self.data.ncon):
-            #     contact = self.data.contact[i]
-            #     # 获取几何体对应的body_id
-            #     body1_id = self.model.geom_bodyid[contact.geom1]
-            #     body2_id = self.model.geom_bodyid[contact.geom2]
-            #     # 通过mj_id2name转换body_id为名称
-            #     body1_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body1_id)
-            #     body2_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body2_id)
-            #     info["pair"+str(i)] = {}
-            #     info["pair"+str(i)]["geom1"] = contact.geom1
-            #     info["pair"+str(i)]["geom2"] = contact.geom2
-            #     info["pair"+str(i)]["pos"] = contact.pos.copy()
-            #     info["pair"+str(i)]["body1_name"] = body1_name
-            #     info["pair"+str(i)]["body2_name"] = body2_name
-            # print(info)
+            contact = self.data.contact[0] # 获取第一个接触信息
+            body1_id = self.model.geom_bodyid[contact.geom1] # 记录发生碰撞的几何体名，body名
+            body2_id = self.model.geom_bodyid[contact.geom2]
+            body1_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body1_id)
+            body2_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body2_id)
+            geom1_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, contact.geom1)
+            geom2_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, contact.geom2)
+            self.last_contact_pos = contact.pos.copy() # 记录碰撞位置
+            self.last_contact_info = {
+                "geom1": geom1_name,
+                "geom2": geom2_name,
+                "body1": body1_name,
+                "body2": body2_name,
+            }
+            print(
+                f"[碰撞] geom: {geom1_name} vs {geom2_name} | "
+                f"body: {body1_name} vs {body2_name} | pos: {self.last_contact_pos}"
+            )
+            if self.visualize and self.pause_on_collision:
+                self._render_scene()
+                self.handle.sync()
+                # input("[碰撞] 按回车继续...")
+
+
+                # if self.collision_pause_mode == "manual":
+                #     input("[碰撞] 按回车继续...")
+                # elif self.collision_pause_mode == "sleep":
+                #     if self.collision_pause_time > 0:
+                #         time.sleep(self.collision_pause_time)
             reward -= 10.0
             terminated = True
 
@@ -412,20 +485,24 @@ class PandaObstacleEnv(gym.Env):
         #     print(f"[失败] 距离目标: {dist_to_goal:.3f}, 奖励: {reward:.3f}")
 
         if not terminated:
-            if time.time() - self.start_t > 20.0:
+            elapsed = float(self.data.time) - self.start_sim_time
+            if elapsed > self.max_episode_time:
                 reward -= 10.0
                 print(f"[超时] 时间过长，奖励减半")
                 terminated = True
 
         if self.visualize and self.handle is not None:
+            self._render_scene()
             self.handle.sync()
-            time.sleep(0.01) 
+            
         
         obs = self._get_observation()
         info = {
             'is_success': not collision and terminated and (dist_to_goal < self.goal_arrival_threshold),
             'distance_to_goal': dist_to_goal,
-            'collision': collision
+            'collision': collision,
+            'collision_pos': self.last_contact_pos,
+            'collision_info': self.last_contact_info,
         }
         
         return obs, reward.astype(np.float32), terminated, False, info
@@ -476,7 +553,7 @@ def train_ppo(
         # )
         
         
-        POLICY_KWARGS = dict(
+        POLICY_KWARGS = dict( # 神经网络结构
             activation_fn=nn.LeakyReLU,
             net_arch=[
                 dict(
@@ -490,8 +567,8 @@ def train_ppo(
             policy="MlpPolicy",
             env=env,
             policy_kwargs=POLICY_KWARGS,
-            verbose=1,
-            n_steps=2048,          
+            verbose=1, # 打印训练日志
+            n_steps=2048, # 每个环境采样2048步再更新一次策略      
             batch_size=2048,       
             n_epochs=10,           
             gamma=0.99,
@@ -507,7 +584,7 @@ def train_ppo(
     print(f"并行环境数: {n_envs}, 本次训练新增步数: {total_timesteps}")
     model.learn(
         total_timesteps=total_timesteps,
-        progress_bar=True
+        progress_bar=True # 显示进度条
     )
     
     model.save(model_save_path)
@@ -522,13 +599,23 @@ def test_ppo(
     obstacle_randomize_pos: bool = True,
     randomize_init_qpos: bool = False,
     randomize_goal_pos: bool = True,
+    # use_sim_time_for_timeout: bool = True,
+    max_episode_time: float = 20.0,
+    pause_on_collision: bool = True,
+    # collision_pause_time: float = 0.8,
+    # collision_pause_mode: str = "manual",
 ) -> None:
     env = PandaObstacleEnv(
         visualize=True,
         obstacle_type=obstacle_type,
         obstacle_randomize_pos=obstacle_randomize_pos,
         randomize_init_qpos=randomize_init_qpos,
-        randomize_goal_pos=randomize_goal_pos
+        randomize_goal_pos=randomize_goal_pos,
+        # use_sim_time_for_timeout=use_sim_time_for_timeout,
+        max_episode_time=max_episode_time,
+        pause_on_collision=pause_on_collision,
+        # collision_pause_time=collision_pause_time,
+        # collision_pause_mode=collision_pause_mode,
     )
     model = PPO.load(model_path, env=env)
 
@@ -553,7 +640,10 @@ def test_ppo(
         
         if info['is_success']:
             success_count += 1
-        print(f"轮次 {ep+1:2d} | 总奖励: {episode_reward:6.2f} | 结果: {'成功' if info['is_success'] else '碰撞/失败'}")
+        print(
+            f"轮次 {ep+1:2d} | 总奖励: {episode_reward:6.2f} | 结果: {'成功' if info['is_success'] else '碰撞/失败'} "
+            f"| 碰撞: {info['collision']} | 距离: {info['distance_to_goal']:.4f}"
+        )
     
     success_rate = (success_count / total_episodes) * 100
     print(f"总成功率: {success_rate:.1f}%")
@@ -589,7 +679,7 @@ if __name__ == "__main__":
     else:
         test_ppo(
             model_path=MODEL_PATH,
-            total_episodes=100,
+            total_episodes=100, # 100
             obstacle_type=OBSTACLE_TYPE,
             obstacle_randomize_pos=OBSTACLE_RANDOMIZE_POS,
             randomize_init_qpos=RANDOMIZE_INIT_QPOS,
