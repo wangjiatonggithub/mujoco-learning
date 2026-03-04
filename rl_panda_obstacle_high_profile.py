@@ -14,8 +14,8 @@ import setproctitle
 from typing import Optional
 from scipy.spatial.transform import Rotation as R
 
-setproctitle.setproctitle("python train_myself.py --lr 0.001")
-# 忽略stable-baselines3的冗余UserWarning
+setproctitle.setproctitle("python train_myself.py") # 服务器伪装
+# 忽略stable_baselines3的冗余UserWarning
 warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines3.common.on_policy_algorithm")
 
 import os
@@ -51,9 +51,9 @@ class PandaObstacleEnv(gym.Env):
         obstacle_randomize_pos: bool = True,
         randomize_init_qpos: bool = False,
         enforce_collision_free_init: bool = True, # 机械臂初始位姿碰撞检测
-        init_qpos_max_attempts: int = 50,
-        init_min_distance: float = 0.08,
-        goal_min_distance: float = 0.08,
+        init_qpos_max_attempts: int = 50, # 机械臂位姿初始化尝试次数上限
+        init_min_distance: float = 0.08, # 机械臂初始位姿与障碍物的最小距离要求
+        goal_min_distance: float = 0.08, # 目标位置与障碍物的最小距离要求
         randomize_goal_pos: bool = True,
         # use_sim_time_for_timeout: bool = False,
         max_episode_time: float = 40, # 20.0
@@ -130,7 +130,7 @@ class PandaObstacleEnv(gym.Env):
         self.obstacle_geom_rgba = {} # 记录障碍物名字与对应的颜色
         all_obstacle_names = set(sum(self.obstacle_geom_names.values(), []))
         for i in range(self.model.ngeom): # model.ngeom返回模型中几何体的数量
-            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, i)
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, i) # 提取出模型中全部障碍物名字，如obstacle_sphere，obstacle_u_left等
             if name in all_obstacle_names:
                 self.obstacle_geom_ids[name] = i
                 self.obstacle_geom_rgba[name] = self.model.geom_rgba[i].copy()
@@ -139,7 +139,7 @@ class PandaObstacleEnv(gym.Env):
         missing = [n for n in active_names if n not in self.obstacle_geom_ids]
         if missing:
             raise ValueError(f"Obstacle geom(s) not found in model: {missing}")
-        self.obstacle_ids = [self.obstacle_geom_ids[n] for n in active_names]
+        self.obstacle_ids = [self.obstacle_geom_ids[n] for n in active_names] # 提取本项目中真正考虑的障碍物id
         self.obstacle_id_1 = self.obstacle_ids[0]
         self._set_active_obstacle(active_names)
 
@@ -150,10 +150,10 @@ class PandaObstacleEnv(gym.Env):
         # print("self.obstacle_positions ", self.obstacle_positions )
         # print("self.obstacle_sizes ", self.obstacle_sizes )
 
-        # 7轴关节角度、目标位置、每个障碍物位置和尺寸
+        
         num_obstacles = self.obstacle_positions.shape[0]
         size_dim = self.obstacle_sizes.shape[1]
-        self.obs_size = 7 + 3 + (3 * num_obstacles) + (size_dim * num_obstacles)
+        self.obs_size = 7 + 3 + (3 * num_obstacles) + (size_dim * num_obstacles) # 7轴关节角度+目标位置+每个障碍物位置+尺寸
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_size,), dtype=np.float32)
 
         self.last_action = self.home_joint_pos
@@ -162,7 +162,7 @@ class PandaObstacleEnv(gym.Env):
     def _render_scene(self) -> None: # 在可视化窗口中渲染目标位置和碰撞发生位置
         if not self.visualize or self.handle is None:
             return
-        self.handle.user_scn.ngeom = 0 # 把场景中的集几何体数量清零
+        self.handle.user_scn.ngeom = 0 # 把场景中的几何体数量清零
         total_geoms = 1 + (1 if self.last_contact_pos is not None else 0) # 目标+碰撞点数量
         self.handle.user_scn.ngeom = total_geoms
 
@@ -171,7 +171,7 @@ class PandaObstacleEnv(gym.Env):
             mujoco.mjtGeom.mjGEOM_SPHERE,
             size=[self.goal_visu_size, 0.0, 0.0],
             pos=self.goal_position,
-            mat=np.eye(3).flatten(),
+            mat=np.eye(3).flatten(), # 目标点的旋转姿态
             rgba=np.array(self.goal_visu_rgba, dtype=np.float32)
         )
 
@@ -190,8 +190,8 @@ class PandaObstacleEnv(gym.Env):
         if seed is not None:
             self.np_random = np.random.default_rng(seed) # 初始化随机数生成器
         
-        # 重置初始位姿
-        mujoco.mj_resetData(self.model, self.data)
+        
+        mujoco.mj_resetData(self.model, self.data) # 将初始位姿重置为默认值
         if self.obstacle_randomize_pos: # 障碍物位置随机初始化
             group_center = self._get_obstacle_center()
             new_center = np.array([
@@ -211,7 +211,7 @@ class PandaObstacleEnv(gym.Env):
         def _set_qpos_and_forward(qpos: np.ndarray) -> None:
             self.data.qpos[:7] = qpos.astype(np.float32)
             self.data.qpos[7:] = [0.04, 0.04] # 设置手指关节固定
-            mujoco.mj_forward(self.model, self.data)
+            mujoco.mj_forward(self.model, self.data) # 执行一步更新但不推进仿真时间，不做碰撞检测和动力学积分，用于在初始化关节位姿时调用
 
         if self.enforce_collision_free_init:
             max_attempts = max(1, int(self.init_qpos_max_attempts))
@@ -222,7 +222,7 @@ class PandaObstacleEnv(gym.Env):
                 else:
                     candidate = self.home_joint_pos
                 _set_qpos_and_forward(candidate)
-                now_ee_pos = self.data.body(self.end_effector_id).xpos.copy()
+                now_ee_pos = self.data.body(self.end_effector_id).xpos.copy() # 获取末端执行器的位置
                 if self.data.ncon == 0 and self._min_distance_to_obstacles(now_ee_pos) >= self.init_min_distance:
                     found = True
                     # print ("yes")
@@ -237,7 +237,7 @@ class PandaObstacleEnv(gym.Env):
                 candidate = self.home_joint_pos
             _set_qpos_and_forward(candidate)
 
-        mujoco.mj_step(self.model, self.data)
+        mujoco.mj_step(self.model, self.data) # 执行一步更新并推进仿真时间
 
         self.obstacle_positions = self._get_obstacle_centers()
         self.obstacle_sizes = self._get_obstacle_sizes_obs()
@@ -268,7 +268,7 @@ class PandaObstacleEnv(gym.Env):
         self.start_t = time.time()
         self.start_sim_time = float(self.data.time)
         self.last_contact_pos = None
-        self.last_contact_info = None
+        self.last_·contact_info = None
         return obs, {}
 
     def _get_observation(self) -> np.ndarray: 
@@ -437,7 +437,7 @@ class PandaObstacleEnv(gym.Env):
     def step(self, action: np.ndarray) -> tuple[np.ndarray, np.float32, bool, bool, dict]:
         joint_ranges = self.model.jnt_range[:7]
         scaled_action = np.zeros(7, dtype=np.float32)
-        for i in range(7): # 把动作从[-1,1]现行映射到关节真正的物理范围
+        for i in range(7): # 把动作从[-1,1]线性映射到关节真正的物理范围
             scaled_action[i] = joint_ranges[i][0] + (action[i] + 1) * 0.5 * (joint_ranges[i][1] - joint_ranges[i][0])
         
         self.data.ctrl[:7] = scaled_action
@@ -449,7 +449,7 @@ class PandaObstacleEnv(gym.Env):
 
         if collision:
             contact = self.data.contact[0] # 获取第一个接触信息
-            body1_id = self.model.geom_bodyid[contact.geom1] # 记录发生碰撞的几何体名，body名
+            body1_id = self.model.geom_bodyid[contact.geom1] # 记录发生碰撞的geom，body名；geom指附着在某个body上的几何体，body指机械臂关节，连杆或障碍物本身
             body2_id = self.model.geom_bodyid[contact.geom2]
             body1_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body1_id)
             body2_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body2_id)
@@ -467,8 +467,8 @@ class PandaObstacleEnv(gym.Env):
             #     f"body: {body1_name} vs {body2_name} | pos: {self.last_contact_pos}"
             # )
             if self.visualize and self.pause_on_collision:
-                self._render_scene()
-                self.handle.sync()
+                self._render_scene() 
+                self.handle.sync() # 将数据物理层面上的更新反映到可视化窗口中
                 # input("[碰撞] 按回车继续...")
 
 
@@ -543,7 +543,7 @@ def train_ppo(
         n_envs=n_envs,
         seed=42,
         vec_env_cls=SubprocVecEnv,
-        vec_env_kwargs={"start_method": "fork"}
+        vec_env_kwargs={"start_method": "fork"} # 把字典作为参数传递给SubprocVecEnv构造函数，指定多进程启动方式为"fork"，在windows系统中必须用"spawn"
     )
     
     if resume_from is not None:
@@ -571,8 +571,8 @@ def train_ppo(
             policy_kwargs=POLICY_KWARGS,
             verbose=1, # 打印训练日志
             n_steps=2048, # 每个环境采样2048步再更新一次策略      
-            batch_size=2048,       
-            n_epochs=10,           
+            batch_size=2048, # 每次采样的数据根据batch_size划分为若干minibatch，每次梯度下降利用batch_size个数据   
+            n_epochs=10, # 利用一次采集到的n_steps个数据进行n_epochs次梯度更新，每个数据利用n_epochs次。n_epochs越大数据利用率越高但会过拟合使训练不稳定         
             gamma=0.99,
             # ent_coef=0.02,  # 增加熵系数，保留后期探索以提升泛化性
             ent_coef = 0.001, 
