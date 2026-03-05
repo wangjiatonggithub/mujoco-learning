@@ -67,6 +67,11 @@ class PandaGoalEnv(gym.GoalEnv):
         super().__init__()
         self.env = env
 
+        # shaping and penalties (defaults)
+        self.gamma = 0.99  # discount used for potential-based shaping
+        self.shaping_scale = 1.0  # scale for potential-based shaping term
+        self.collision_penalty = -10.0  # additional penalty when collision occurs
+
         # Build spaces
         # observation (without desired_goal): joint_pos(7) + obstacles positions + sizes
         num_obstacles = self.env.obstacle_positions.shape[0]
@@ -81,23 +86,70 @@ class PandaGoalEnv(gym.GoalEnv):
         self.action_space = self.env.action_space
 
     def compute_reward(self, achieved_goal: np.ndarray, desired_goal: np.ndarray, info: dict) -> float:
-        dist = np.linalg.norm(achieved_goal - desired_goal)
-        return 0.0 if dist < self.env.goal_arrival_threshold else -1.0
+        """Return reward composed of:
+        - sparse success reward (0 success / -1 failure)
+        - collision penalty (if info['collision'] True)
+        - potential-based shaping term: shaping_scale * (prev_dist - gamma * dist)
+        Note: info is expected to contain 'prev_distance' (distance before the transition) when using HER replay buffer.
+        """
+        # distances
+        dist = float(np.linalg.norm(achieved_goal - desired_goal))
+        prev_dist = float(info.get('prev_distance', dist))
+
+        # collision
+        collision = bool(info.get('collision', False))
+
+        # sparse success (success only if within threshold and no collision)
+        success = (not collision) and (dist < self.env.goal_arrival_threshold)
+        sparse_reward = 0.0 if success else -1.0
+
+        # collision penalty
+        coll_pen = self.collision_penalty if collision else 0.0
+
+        # potential-based shaping (phi = -distance)
+        shaping = self.shaping_scale * (prev_dist - self.gamma * dist)
+
+        total = sparse_reward + coll_pen + shaping
+        return float(total)
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         self.env.reset(seed=seed)
         return self._get_obs_dict()
 
     def step(self, action):
+        # record previous achieved and distance so that replay buffer / HER can access it
+        prev_achieved = self.env.data.body(self.env.end_effector_id).xpos.copy()
+        desired = self.env.goal_position.copy()
+        prev_dist = float(np.linalg.norm(prev_achieved - desired))
+
+        # compute minimum distance to obstacles at previous step and store for filtering
+        try:
+            prev_min_dist = float(self.env._min_distance_to_obstacles(prev_achieved))
+        except Exception:
+            prev_min_dist = float(np.inf)
+
         # action assumed in [-1,1]^7 as original env
         obs_raw, _, terminated, truncated, info = self.env.step(action)
+
+        # ensure info contains previous distance and min-dist for replay buffer
+        info = dict(info) if info is not None else {}
+        info['prev_achieved'] = prev_achieved
+        info['prev_distance'] = prev_dist
+        info['min_dist_to_obstacle'] = prev_min_dist
+
         achieved = self.env.data.body(self.env.end_effector_id).xpos.copy()
-        desired = self.env.goal_position.copy()
         obs_dict = self._get_obs_dict()
-        # compute sparse reward consistent with compute_reward
+
+        # compute reward using compute_reward (includes sparse + collision + shaping)
         reward = self.compute_reward(achieved, desired, info)
-        done = terminated or truncated or (np.linalg.norm(achieved - desired) < self.env.goal_arrival_threshold)
-        return obs_dict, reward, done, False, info
+
+        # done if underlying env terminated/truncated, collision occurred, or success
+        collision = bool(info.get('collision', False))
+        dist = float(np.linalg.norm(achieved - desired))
+        success = (not collision) and (dist < self.env.goal_arrival_threshold)
+        done = bool(terminated or truncated or collision or success)
+
+        return obs_dict, float(reward), done, False, info
 
     def _get_obs_dict(self):
         # observation without desired_goal
@@ -117,6 +169,176 @@ class PandaGoalEnv(gym.GoalEnv):
         self.env.close()
 
 
+class FilteredHerReplayBuffer(HerReplayBuffer):
+    """HER replay buffer that filters out relabeled samples which were collected
+    after a collision or whose stored min distance to obstacles is below a threshold.
+    This class wraps HerReplayBuffer.sample and attempts resampling up to a limit
+    to produce a full batch of valid samples.
+    """
+    def __init__(self, *args, min_dist_threshold: float = 0.02, max_filter_attempts: int = 5, max_goal_resample_attempts: int = 5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.min_dist_threshold = float(min_dist_threshold)
+        self.max_filter_attempts = int(max_filter_attempts) # 最多采样的batch次数
+        # When a relabeled desired_goal is unsafe, how many times to try resampling a different goal
+        self.max_goal_resample_attempts = int(max_goal_resample_attempts) # 选定一个transition数据后，最多尝试选取desired_goal的次数
+
+    def sample(self, batch_size: int, env=None):
+        """HER采样, 并确保采样的transition数据和desired_goal都不靠近障碍物。"""
+        """Oversample-and-select scheme with additional safety check for relabeled goals.
+        - repeatedly call parent sample() up to `max_filter_attempts` times
+        - collect only transitions whose own info shows no collision and min_dist >= threshold
+        - additionally, when relabeled desired_goal is present in the returned batch,
+          ensure that that goal point is also sufficiently far from obstacles
+        - stop when we have `batch_size` valid transitions and return them
+        - fallback to last parent's batch if not enough valid transitions collected
+        """
+        collected = {}  # dict[key] -> list of values (or dict of lists for nested dicts)
+        collected_count = 0
+        attempts = 0
+
+        def _append(collected, key, val): # 为字典collected添加键key和值val
+            # Normalize and append a single element `val` under `key` in collected
+            if isinstance(val, dict):
+                d = collected.setdefault(key, {})
+                for subk, subv in val.items():
+                    d.setdefault(subk, []).append(np.asarray(subv))
+            else:
+                collected.setdefault(key, []).append(np.asarray(val))
+
+        last_batch = None
+        while collected_count < batch_size and attempts < self.max_filter_attempts:
+            batch = super().sample(batch_size, env=env)  # 父类采样（可能已扩展为包含 relabeled 的多个项）
+            last_batch = batch
+            infos = batch.get('infos', None)
+            if infos is None:
+                return batch
+
+            # Try to find relabeled desired goals in the batch (various sb3 layouts)
+            desired_goals = None
+            # Common sb3 keys: 'observations' (dict) or 'obs'
+            obs = batch.get('observations', None)
+            if isinstance(obs, dict):
+                desired_goals = obs.get('desired_goal', None)
+            if desired_goals is None:
+                obs2 = batch.get('obs', None)
+                if isinstance(obs2, dict):
+                    desired_goals = obs2.get('desired_goal', None)
+            # Sometimes 'next_observations' may carry goals depending on implementation
+            if desired_goals is None:
+                next_obs = batch.get('next_observations', None)
+                if isinstance(next_obs, dict):
+                    desired_goals = next_obs.get('desired_goal', None)
+
+            # helper to compute min distance for a 3D point using env (with wrapper fallbacks)
+            def _min_dist_point(pt):
+                if pt is None:
+                    return -np.inf
+                try:
+                    # ensure numpy array and shape (3,) if possible
+                    pt_arr = np.asarray(pt)
+                    if pt_arr.size == 0:
+                        return -np.inf
+                    # try common wrapper attributes to reach underlying env
+                    target_envs = [env, getattr(env, 'env', None), getattr(env, 'unwrapped', None)]
+                    for candidate in target_envs:
+                        if candidate is None:
+                            continue
+                        if hasattr(candidate, '_min_distance_to_obstacles'):
+                            try:
+                                return float(candidate._min_distance_to_obstacles(pt_arr))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                return -np.inf
+
+            # build mask considering transition info; for unsafe relabeled goals we'll try to resample targets
+            mask = []
+            for idx, info in enumerate(infos):
+                if info is None:
+                    mask.append(True)
+                    continue
+                collision = bool(info.get('collision', False))
+                min_dist = float(info.get('min_dist_to_obstacle', -np.inf))
+
+                # If transition itself is bad, reject immediately
+                if collision or (min_dist < self.min_dist_threshold):
+                    mask.append(False)
+                    continue
+
+                # transition is OK; now ensure relabeled desired_goal (if present) is safe.
+                goal_safe = True
+                if desired_goals is not None:
+                    try:
+                        dg = np.asarray(desired_goals[idx])
+                        dg_min_dist = _min_dist_point(dg)
+                        if dg_min_dist >= self.min_dist_threshold:
+                            goal_safe = True
+                        else:
+                            # try to resample a safe desired_goal without discarding this transition
+                            goal_safe = False
+                            for try_i in range(self.max_goal_resample_attempts):
+                                single = super().sample(1, env=env)
+                                # extract candidate goal from single
+                                cand = None
+                                s_obs = single.get('observations', None)
+                                if isinstance(s_obs, dict):
+                                    cand = s_obs.get('desired_goal', None)
+                                if cand is None:
+                                    s_obs2 = single.get('obs', None)
+                                    if isinstance(s_obs2, dict):
+                                        cand = s_obs2.get('desired_goal', None)
+                                if cand is None:
+                                    s_next = single.get('next_observations', None)
+                                    if isinstance(s_next, dict):
+                                        cand = s_next.get('desired_goal', None)
+                                if cand is None:
+                                    continue
+                                cand = np.asarray(cand).squeeze()
+                                cand_min = _min_dist_point(cand)
+                                if cand_min >= self.min_dist_threshold:
+                                    # accept this candidate and write back into batch so reward can be recomputed
+                                    goal_safe = True
+                                    try:
+                                        if isinstance(obs, dict):
+                                            batch['observations']['desired_goal'][idx] = cand
+                                        if 'next_observations' in batch and isinstance(batch['next_observations'], dict):
+                                            batch['next_observations']['desired_goal'][idx] = cand
+                                        if 'obs' in batch and isinstance(batch['obs'], dict):
+                                            batch['obs']['desired_goal'][idx] = cand
+                                    except Exception:
+                                        pass
+                                    break
+                    except Exception:
+                        goal_safe = True
+
+                mask.append(bool(goal_safe))
+
+            # collect passing indices
+            for idx, ok in enumerate(mask):
+                if not ok:
+                    continue
+                for k, v in batch.items():
+                    _append(collected, k, v[idx])
+                collected_count += 1
+                if collected_count >= batch_size:
+                    break
+
+            attempts += 1
+
+        # If we collected enough valid samples, build final batch dict and return
+        if collected_count >= batch_size:
+            final = {}
+            for k, val_list in collected.items():
+                if isinstance(val_list, dict):
+                    final[k] = {subk: np.stack(sublist, axis=0) for subk, sublist in val_list.items()}
+                else:
+                    final[k] = np.stack(val_list, axis=0)
+            return final
+
+        # Fallback
+        return last_batch
+
 def train_sac_her(
     n_envs: int = 8,
     total_timesteps: int = 2_000_000,
@@ -127,6 +349,7 @@ def train_sac_her(
     randomize_init_qpos: bool = False,
     randomize_goal_pos: bool = True,
     max_episode_steps: int = 500,
+    min_dist_threshold: float = 0.02,  # 新增：用于 FilteredHerReplayBuffer 的距离阈值（米）
 ):
     ENV_KWARGS = {
         'visualize': visualize,
@@ -154,6 +377,7 @@ def train_sac_her(
         goal_selection_strategy="future", # 从未来轨迹中采样目标位置
         online_sampling=True, # 在采样时动态生成HER样本而不是预先生成并存储，节省内存但增加采样时间
         max_episode_length=max_episode_steps,
+        min_dist_threshold=min_dist_threshold,  # 传递到 FilteredHerReplayBuffer，用于过滤靠近障碍物的 relabeled 样本
     )
 
     policy_kwargs = dict(
@@ -173,7 +397,7 @@ def train_sac_her(
         gamma=0.99,
         train_freq=1, # 每采样1步更新一次策略
         gradient_steps=1, # 每次更新利用1步采样数据
-        replay_buffer_class=HerReplayBuffer,
+        replay_buffer_class=FilteredHerReplayBuffer,
         replay_buffer_kwargs=replay_buffer_kwargs,
         device="cuda" if torch.cuda.is_available() else "cpu",
         tensorboard_log="./tensorboard/panda_sac_her/"
@@ -212,14 +436,17 @@ def test_sac_her(
         done = False
         episode_reward = 0.0
         steps = 0
+        last_info = {}
         while not done and steps < max_episode_steps:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, _, info = env.step(action)
+            last_info = info
             episode_reward += reward
             steps += 1
         achieved = obs['achieved_goal']
         desired = obs['desired_goal']
-        is_success = np.linalg.norm(achieved - desired) < env.env.goal_arrival_threshold
+        # success only if within threshold AND no collision occurred in the episode
+        is_success = (np.linalg.norm(achieved - desired) < env.env.goal_arrival_threshold) and (not last_info.get('collision', False))
         if is_success:
             success_count += 1
         print(f"Ep {ep+1}: reward={episode_reward:.2f} success={is_success}")
