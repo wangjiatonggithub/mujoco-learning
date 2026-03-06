@@ -207,7 +207,7 @@ class FilteredHerReplayBuffer(HerReplayBuffer):
 
         last_batch = None
         while collected_count < batch_size and attempts < self.max_filter_attempts:
-            batch = super().sample(batch_size, env=env)  # 父类采样（可能已扩展为包含 relabeled 的多个项）
+            batch = super().sample(batch_size, env=env)  # 父类采样函数，在sb3中定义
             last_batch = batch
             infos = batch.get('infos', None)
             if infos is None:
@@ -254,7 +254,7 @@ class FilteredHerReplayBuffer(HerReplayBuffer):
 
             # build mask considering transition info; for unsafe relabeled goals we'll try to resample targets
             mask = []
-            for idx, info in enumerate(infos):
+            for idx, info in enumerate(infos): # enumerate函数同时提取索引和值
                 if info is None:
                     mask.append(True)
                     continue
