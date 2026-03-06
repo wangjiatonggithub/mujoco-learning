@@ -1,14 +1,19 @@
 import numpy as np
 import mujoco
-import gym
-from gym import spaces
+# try:
+import gymnasium as gym
+from gymnasium import spaces
+# except Exception:
+# import gym
+# from gym import spaces
 
 # Off-policy algorithm and HER
-try:
-    from stable_baselines3 import SAC
-    from sb3_contrib.her import HerReplayBuffer
-except Exception:
-    raise ImportError("Please install stable-baselines3 and sb3-contrib: pip install stable-baselines3 sb3-contrib")
+# try:
+from stable_baselines3 import SAC
+from stable_baselines3 import HerReplayBuffer
+# from sb3_contrib.her import HerReplayBuffer
+# except Exception:
+#     raise ImportError("Please install stable-baselines3 and sb3-contrib: pip install stable-baselines3 sb3-contrib")
 
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -50,13 +55,16 @@ def delete_flag_file(flag_filename="rl_visu_flag"):
 # ...existing PandaObstacleEnv class should remain in original file; we will import it instead of copying.
 # To keep this new file self-contained, we will import the original module if available.
 
-try:
-    from rl_panda_obstacle_high_profile import PandaObstacleEnv
-except Exception:
-    raise ImportError("Could not import PandaObstacleEnv from rl_panda_obstacle_high_profile.py. Make sure that file is in PYTHONPATH and contains PandaObstacleEnv.")
+# try:
+from rl_panda_obstacle_high_profile import PandaObstacleEnv
+# except Exception:
+#     raise ImportError("Could not import PandaObstacleEnv from rl_panda_obstacle_high_profile.py. Make sure that file is in PYTHONPATH and contains PandaObstacleEnv.")
 
 
-class PandaGoalEnv(gym.GoalEnv):
+GoalEnvBase = getattr(gym, "GoalEnv", gym.Env)
+
+
+class PandaGoalEnv(GoalEnvBase):
     """Wrapper that converts PandaObstacleEnv to a GoalEnv for HER.
     observation: dict with keys 'observation', 'achieved_goal', 'desired_goal'
     - 'observation' excludes desired_goal (only joint+obstacles info)
@@ -85,36 +93,51 @@ class PandaGoalEnv(gym.GoalEnv):
         })
         self.action_space = self.env.action_space
 
-    def compute_reward(self, achieved_goal: np.ndarray, desired_goal: np.ndarray, info: dict) -> float:
+    def compute_reward(self, achieved_goal: np.ndarray, desired_goal: np.ndarray, info) -> np.ndarray:
         """Return reward composed of:
         - sparse success reward (0 success / -1 failure)
         - collision penalty (if info['collision'] True)
         - potential-based shaping term: shaping_scale * (prev_dist - gamma * dist)
         Note: info is expected to contain 'prev_distance' (distance before the transition) when using HER replay buffer.
+        Supports both single-step and vectorized inputs (list of info dicts).
         """
-        # distances
-        dist = float(np.linalg.norm(achieved_goal - desired_goal))
-        prev_dist = float(info.get('prev_distance', dist))
+        achieved_goal = np.asarray(achieved_goal)
+        desired_goal = np.asarray(desired_goal)
 
-        # collision
-        collision = bool(info.get('collision', False))
+        # distances (vectorized)
+        dist = np.linalg.norm(achieved_goal - desired_goal, axis=-1)
+
+        # info handling
+        if isinstance(info, (list, tuple)):
+            prev_dist = np.array([i.get('prev_distance', d) if isinstance(i, dict) else d for i, d in zip(info, np.atleast_1d(dist))], dtype=np.float32)
+            collision = np.array([bool(i.get('collision', False)) if isinstance(i, dict) else False for i in info], dtype=bool)
+        elif isinstance(info, dict):
+            prev_dist = np.array(info.get('prev_distance', dist), dtype=np.float32)
+            collision = np.array(info.get('collision', False), dtype=bool)
+        else:
+            prev_dist = np.array(dist, dtype=np.float32)
+            collision = np.zeros_like(dist, dtype=bool)
 
         # sparse success (success only if within threshold and no collision)
-        success = (not collision) and (dist < self.env.goal_arrival_threshold)
-        sparse_reward = 0.0 if success else -1.0
+        success = (~collision) & (dist < self.env.goal_arrival_threshold)
+        sparse_reward = np.where(success, 0.0, -1.0)
 
         # collision penalty
-        coll_pen = self.collision_penalty if collision else 0.0
+        coll_pen = np.where(collision, self.collision_penalty, 0.0)
 
         # potential-based shaping (phi = -distance)
         shaping = self.shaping_scale * (prev_dist - self.gamma * dist)
 
         total = sparse_reward + coll_pen + shaping
-        return float(total)
+        return float(total) if np.isscalar(total) else total.astype(np.float32)
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
-        self.env.reset(seed=seed)
-        return self._get_obs_dict()
+        result = self.env.reset(seed=seed, options=options)
+        if isinstance(result, tuple) and len(result) == 2:
+            _, info = result
+        else:
+            info = {}
+        return self._get_obs_dict(), info
 
     def step(self, action):
         # record previous achieved and distance so that replay buffer / HER can access it
@@ -196,22 +219,63 @@ class FilteredHerReplayBuffer(HerReplayBuffer):
         collected_count = 0
         attempts = 0
 
+        def _batch_to_dict(b):
+            if isinstance(b, dict):
+                return b
+            if hasattr(b, "_asdict"):
+                return b._asdict()
+            if hasattr(b, "__dict__"):
+                return dict(vars(b))
+            return {}
+
+        def _normalize_val(v):
+            if isinstance(v, torch.Tensor):
+                return v
+            return np.asarray(v)
+
+        def _stack_list(vals):
+            if len(vals) == 0:
+                return vals
+            if isinstance(vals[0], torch.Tensor):
+                return torch.stack(vals, dim=0)
+            return np.stack(vals, axis=0)
+
+        def _to_numpy(x):
+            if isinstance(x, torch.Tensor):
+                return x.detach().cpu().numpy()
+            return np.asarray(x)
+
+        def _assign_goal(container, key, idx, cand):
+            if not isinstance(container, dict):
+                return
+            if key not in container:
+                return
+            target = container[key]
+            if isinstance(target, torch.Tensor):
+                cand_t = torch.as_tensor(cand, device=target.device, dtype=target.dtype)
+                target[idx] = cand_t
+            else:
+                target[idx] = cand
+
         def _append(collected, key, val): # 为字典collected添加键key和值val
             # Normalize and append a single element `val` under `key` in collected
             if isinstance(val, dict):
                 d = collected.setdefault(key, {})
                 for subk, subv in val.items():
-                    d.setdefault(subk, []).append(np.asarray(subv))
+                    d.setdefault(subk, []).append(_normalize_val(subv))
             else:
-                collected.setdefault(key, []).append(np.asarray(val))
+                collected.setdefault(key, []).append(_normalize_val(val))
 
         last_batch = None
+        last_batch_raw = None
         while collected_count < batch_size and attempts < self.max_filter_attempts:
-            batch = super().sample(batch_size, env=env)  # 父类采样函数，在sb3中定义
+            batch_raw = super().sample(batch_size, env=env)  # 父类采样函数，在sb3中定义
+            batch = _batch_to_dict(batch_raw)
             last_batch = batch
+            last_batch_raw = batch_raw
             infos = batch.get('infos', None)
             if infos is None:
-                return batch
+                return batch_raw
 
             # Try to find relabeled desired goals in the batch (various sb3 layouts)
             desired_goals = None
@@ -270,7 +334,7 @@ class FilteredHerReplayBuffer(HerReplayBuffer):
                 goal_safe = True
                 if desired_goals is not None:
                     try:
-                        dg = np.asarray(desired_goals[idx])
+                        dg = _to_numpy(desired_goals[idx])
                         dg_min_dist = _min_dist_point(dg)
                         if dg_min_dist >= self.min_dist_threshold:
                             goal_safe = True
@@ -278,7 +342,8 @@ class FilteredHerReplayBuffer(HerReplayBuffer):
                             # try to resample a safe desired_goal without discarding this transition
                             goal_safe = False
                             for try_i in range(self.max_goal_resample_attempts):
-                                single = super().sample(1, env=env)
+                                single_raw = super().sample(1, env=env)
+                                single = _batch_to_dict(single_raw)
                                 # extract candidate goal from single
                                 cand = None
                                 s_obs = single.get('observations', None)
@@ -294,18 +359,15 @@ class FilteredHerReplayBuffer(HerReplayBuffer):
                                         cand = s_next.get('desired_goal', None)
                                 if cand is None:
                                     continue
-                                cand = np.asarray(cand).squeeze()
+                                cand = _to_numpy(cand).squeeze()
                                 cand_min = _min_dist_point(cand)
                                 if cand_min >= self.min_dist_threshold:
                                     # accept this candidate and write back into batch so reward can be recomputed
                                     goal_safe = True
                                     try:
-                                        if isinstance(obs, dict):
-                                            batch['observations']['desired_goal'][idx] = cand
-                                        if 'next_observations' in batch and isinstance(batch['next_observations'], dict):
-                                            batch['next_observations']['desired_goal'][idx] = cand
-                                        if 'obs' in batch and isinstance(batch['obs'], dict):
-                                            batch['obs']['desired_goal'][idx] = cand
+                                        _assign_goal(batch.get('observations', None), 'desired_goal', idx, cand)
+                                        _assign_goal(batch.get('next_observations', None), 'desired_goal', idx, cand)
+                                        _assign_goal(batch.get('obs', None), 'desired_goal', idx, cand)
                                     except Exception:
                                         pass
                                     break
@@ -319,7 +381,10 @@ class FilteredHerReplayBuffer(HerReplayBuffer):
                 if not ok:
                     continue
                 for k, v in batch.items():
-                    _append(collected, k, v[idx])
+                    if isinstance(v, dict):
+                        _append(collected, k, {subk: subv[idx] for subk, subv in v.items()})
+                    else:
+                        _append(collected, k, v[idx])
                 collected_count += 1
                 if collected_count >= batch_size:
                     break
@@ -331,19 +396,24 @@ class FilteredHerReplayBuffer(HerReplayBuffer):
             final = {}
             for k, val_list in collected.items():
                 if isinstance(val_list, dict):
-                    final[k] = {subk: np.stack(sublist, axis=0) for subk, sublist in val_list.items()}
+                    final[k] = {subk: _stack_list(sublist) for subk, sublist in val_list.items()}
                 else:
-                    final[k] = np.stack(val_list, axis=0)
-            return final
+                    final[k] = _stack_list(val_list)
+            if isinstance(last_batch_raw, dict) or last_batch_raw is None:
+                return final
+            try:
+                return type(last_batch_raw)(**final)
+            except Exception:
+                return last_batch_raw
 
         # Fallback
-        return last_batch
+        return last_batch_raw if last_batch_raw is not None else last_batch
 
 def train_sac_her(
     n_envs: int = 8,
     total_timesteps: int = 2_000_000,
     model_save_path: str = "panda_sac_her",
-    visualize: bool = False,
+    visualize: bool = True,
     obstacle_type: str = "sphere",
     obstacle_randomize_pos: bool = True,
     randomize_init_qpos: bool = False,
@@ -375,14 +445,12 @@ def train_sac_her(
     replay_buffer_kwargs = dict(
         n_sampled_goal=4, # 每个实际采样轨迹额外多生成多少HER样本
         goal_selection_strategy="future", # 从未来轨迹中采样目标位置
-        online_sampling=True, # 在采样时动态生成HER样本而不是预先生成并存储，节省内存但增加采样时间
-        max_episode_length=max_episode_steps,
         min_dist_threshold=min_dist_threshold,  # 传递到 FilteredHerReplayBuffer，用于过滤靠近障碍物的 relabeled 样本
     )
 
     policy_kwargs = dict(
         activation_fn=nn.LeakyReLU,
-        net_arch=[dict(pi=[512, 256, 128], qf=[512, 256, 128])]
+        net_arch=dict(pi=[512, 256, 128], qf=[512, 256, 128])
     )
 
     model = SAC(
@@ -391,6 +459,7 @@ def train_sac_her(
         policy_kwargs=policy_kwargs,
         verbose=1, # 打印训练日志
         buffer_size=1_000_000,
+        learning_starts=2*max_episode_steps,  # 至少跑完一个episode后再开始采样/训练
         learning_rate=3e-4,
         batch_size=256,
         tau=0.005, # 目标网络软更新系数
@@ -470,7 +539,7 @@ if __name__ == "__main__":
             n_envs=8,
             total_timesteps=2_000_000,
             model_save_path=MODEL_PATH,
-            visualize=False,
+            visualize=True,
             obstacle_type=OBSTACLE_TYPE,
             obstacle_randomize_pos=OBSTACLE_RANDOMIZE_POS,
             randomize_init_qpos=RANDOMIZE_INIT_QPOS,

@@ -1,7 +1,12 @@
 import numpy as np
 import mujoco
-import gym
-from gym import spaces
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+except Exception as exc:
+    raise ImportError(
+        "stable-baselines3>=2.x requires gymnasium. Please install gymnasium in the current env."
+    ) from exc
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -10,11 +15,11 @@ import warnings
 import torch
 import mujoco.viewer
 import time
-import setproctitle
+# import setproctitle
 from typing import Optional
 from scipy.spatial.transform import Rotation as R
 
-setproctitle.setproctitle("python train_myself.py") # 服务器伪装
+# setproctitle.setproctitle("python train_myself.py") # 服务器伪装
 # 忽略stable_baselines3的冗余UserWarning
 warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines3.common.on_policy_algorithm")
 
@@ -242,23 +247,7 @@ class PandaObstacleEnv(gym.Env):
         self.obstacle_positions = self._get_obstacle_centers()
         self.obstacle_sizes = self._get_obstacle_sizes_obs()
 
-        if self.randomize_goal_pos: # 目标点位置随机初始化
-            max_attempts = 100
-            for _ in range(max_attempts):
-                candidate = np.array([
-                    self.np_random.uniform(-0.5, 0.5),
-                    self.np_random.uniform(-0.7, 0.7),
-                    self.np_random.uniform(0.2, 0.8),
-                ], dtype=np.float32)
-                if (not self._is_point_in_any_obstacle(candidate)
-                        and self._min_distance_to_obstacles(candidate) >= self.goal_min_distance):
-                    self.goal_position = candidate
-                    break
-            else:
-                warnings.warn("Goal position inside obstacle after retries; using base position.")
-                self.goal_position = self.goal_position_base.copy()
-        else:
-            self.goal_position = self.goal_position_base.copy()
+        self.goal_position = self._sample_goal_position(randomize=self.randomize_goal_pos)
         
         if self.visualize:
             self._render_scene()
@@ -268,8 +257,42 @@ class PandaObstacleEnv(gym.Env):
         self.start_t = time.time()
         self.start_sim_time = float(self.data.time)
         self.last_contact_pos = None
-        self.last_·contact_info = None
+        self.last_contact_info = None
         return obs, {}
+
+    def _sample_goal_position(self, randomize: bool = True) -> np.ndarray:
+        """Sample a goal that is outside obstacles and at least goal_min_distance away.
+        If `randomize` is False, prefer the base goal but fallback to random valid goal when needed.
+        """
+        max_attempts = 200
+
+        def _is_valid(pt: np.ndarray) -> bool:
+            return (not self._is_point_in_any_obstacle(pt)) and (
+                self._min_distance_to_obstacles(pt) >= self.goal_min_distance
+            )
+
+        if not randomize:
+            base = self.goal_position_base.copy()
+            if _is_valid(base):
+                return base
+
+        best = None
+        best_dist = -np.inf
+        for _ in range(max_attempts):
+            candidate = np.array([
+                self.np_random.uniform(-0.5, 0.5),
+                self.np_random.uniform(-0.7, 0.7),
+                self.np_random.uniform(0.2, 0.8),
+            ], dtype=np.float32)
+            dist = self._min_distance_to_obstacles(candidate)
+            if dist > best_dist:
+                best_dist = dist
+                best = candidate
+            if _is_valid(candidate):
+                return candidate
+
+        warnings.warn("Goal position unsafe after retries; using farthest candidate.")
+        return best if best is not None else self.goal_position_base.copy()
 
     def _get_observation(self) -> np.ndarray: 
         joint_pos = self.data.qpos[:7].copy().astype(np.float32)
