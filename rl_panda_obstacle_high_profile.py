@@ -677,7 +677,7 @@ def test_ppo(
 
 
 if __name__ == "__main__":
-    TRAIN_MODE = True  # 设为True开启训练模式
+    TRAIN_MODE = False  # 设为True开启训练模式
     OBSTACLE_TYPE = "box"  # 可选: sphere | box | cylinder
     OBSTACLE_RANDOMIZE_POS = True  # 是否随机变化障碍物位置
     RANDOMIZE_INIT_QPOS = True  # 是否随机机械臂初始位姿

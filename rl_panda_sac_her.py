@@ -97,8 +97,7 @@ class PandaGoalEnv(GoalEnvBase):
         """Return reward composed of:
         - sparse success reward (0 success / -1 failure)
         - collision penalty (if info['collision'] True)
-        - potential-based shaping term: shaping_scale * (prev_dist - gamma * dist)
-        Note: info is expected to contain 'prev_distance' (distance before the transition) when using HER replay buffer.
+        - (commented) potential-based shaping term: shaping_scale * (prev_dist - gamma * dist)
         Supports both single-step and vectorized inputs (list of info dicts).
         """
         achieved_goal = np.asarray(achieved_goal)
@@ -126,9 +125,10 @@ class PandaGoalEnv(GoalEnvBase):
         coll_pen = np.where(collision, self.collision_penalty, 0.0)
 
         # potential-based shaping (phi = -distance)
-        shaping = self.shaping_scale * (prev_dist - self.gamma * dist)
+        # shaping = self.shaping_scale * (prev_dist - self.gamma * dist)
 
-        total = sparse_reward + coll_pen + shaping
+        # total = sparse_reward + coll_pen + shaping
+        total = sparse_reward + coll_pen
         return float(total) if np.isscalar(total) else total.astype(np.float32)
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -486,6 +486,8 @@ def test_sac_her(
     randomize_init_qpos: bool = False,
     randomize_goal_pos: bool = True,
     max_episode_steps: int = 500,
+    min_dist_threshold: float = 0.02,
+    render_sleep: float = 0.1,
 ):
     env = PandaGoalEnv(PandaObstacleEnv(
         visualize=True,
@@ -497,11 +499,20 @@ def test_sac_her(
         pause_on_collision=True
     ))
 
-    model = SAC.load(model_path, env=env)
+    # Ensure HER replay buffer class/kwargs match the training setup
+    custom_objects = {
+        "replay_buffer_class": FilteredHerReplayBuffer,
+        "replay_buffer_kwargs": dict(
+            n_sampled_goal=4,
+            goal_selection_strategy="future",
+            min_dist_threshold=min_dist_threshold,
+        ),
+    }
+    model = SAC.load(model_path, env=env, custom_objects=custom_objects)
 
     success_count = 0
     for ep in range(total_episodes):
-        obs = env.reset()
+        obs, _ = env.reset()
         done = False
         episode_reward = 0.0
         steps = 0
@@ -509,6 +520,8 @@ def test_sac_her(
         while not done and steps < max_episode_steps:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, _, info = env.step(action)
+            if render_sleep > 0:
+                time.sleep(render_sleep)
             last_info = info
             episode_reward += reward
             steps += 1
