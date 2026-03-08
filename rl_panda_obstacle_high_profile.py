@@ -200,9 +200,11 @@ class PandaObstacleEnv(gym.Env):
         if self.obstacle_randomize_pos: # 障碍物位置随机初始化
             group_center = self._get_obstacle_center()
             new_center = np.array([
-                self.np_random.uniform(-0.3, 0.3),
-                group_center[1],
-                group_center[2]
+                self.np_random.uniform(-0.3, -0.3),
+                self.np_random.uniform(-0.2, 0.2),
+                self.np_random.uniform(0.4, 0.55)
+                # group_center[1],
+                # group_center[2]
             ], dtype=np.float32)
             delta = new_center - group_center
             for geom_id in self.obstacle_ids:

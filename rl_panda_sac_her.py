@@ -488,6 +488,7 @@ def test_sac_her(
     max_episode_steps: int = 500,
     min_dist_threshold: float = 0.02,
     render_sleep: float = 0.1,
+    episode_pause: float = 10.0,
 ):
     env = PandaGoalEnv(PandaObstacleEnv(
         visualize=True,
@@ -532,6 +533,8 @@ def test_sac_her(
         if is_success:
             success_count += 1
         print(f"Ep {ep+1}: reward={episode_reward:.2f} success={is_success}")
+        if episode_pause > 0:
+            time.sleep(episode_pause)
 
     print(f"Success rate: {success_count}/{total_episodes}")
     env.close()
@@ -539,7 +542,7 @@ def test_sac_her(
 
 if __name__ == "__main__":
     TRAIN_MODE = True
-    OBSTACLE_TYPE = "box"
+    OBSTACLE_TYPE = "sphere"
     OBSTACLE_RANDOMIZE_POS = True
     RANDOMIZE_INIT_QPOS = True
     RANDOMIZE_GOAL_POS = True
