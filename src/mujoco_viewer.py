@@ -73,7 +73,7 @@ class CustomViewer:
                 rgba=rgba
             )
     
-    def addObstacles(self, obstacles_pos:np.ndarray, obstacles_type:list, obstacles_size:np.ndarray, obstacles_rgba:np.ndarray):
+    def addObstacles(self, obstacles_pos:np.ndarray, obstacles_type:list, obstacles_size:np.ndarray, obstacles_rgba:np.ndarray, out_xml_path: str | None = None):
         """
         Add obstacles to the model.
         :param obstacles_pos: (n, 3) array of obstacle positions
@@ -108,11 +108,23 @@ class CustomViewer:
             obstacle_geom.set("mass", "0.0")  # 静态物体（质量=0，不会被推动）
             obstacle_geom.set("rgba", f"{rgba[0]:.3f} {rgba[1]:.3f} {rgba[2]:.3f} {rgba[3]:.3f}")
 
-        new_xml_path = self.model_path.replace(".xml", "_with_obstacles.xml")
+        if out_xml_path is None:
+            import os
+            import time
+            base_name = os.path.splitext(os.path.basename(self.model_path))[0]
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            pid = os.getpid()
+            new_xml_path = os.path.join(
+                "/tmp",
+                f"{base_name}_with_obstacles_{ts}_{pid}.xml",
+            )
+        else:
+            new_xml_path = out_xml_path
         tree.write(new_xml_path, encoding="utf-8", xml_declaration=True)
     
         self.model = mujoco.MjModel.from_xml_path(new_xml_path)
         self.data = mujoco.MjData(self.model)
+        self.generated_model_path = new_xml_path
 
         print(f"原始 Geom 数：{self.original_model.ngeom}")
         print(f"新模型 Geom 数：{self.model.ngeom}")

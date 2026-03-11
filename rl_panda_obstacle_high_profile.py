@@ -61,8 +61,9 @@ class PandaObstacleEnv(gym.Env):
         goal_min_distance: float = 0.08, # 目标位置与障碍物的最小距离要求
         randomize_goal_pos: bool = True,
         # use_sim_time_for_timeout: bool = False,
-        max_episode_time: float = 40, # 20.0
+        max_episode_time: float = 20, # 20.0
         pause_on_collision: bool = False, # 测试时碰到障碍物就停止，以便清楚展示碰撞情况
+        initial_pause_s: float = 5.0, # 每次reset后初始位姿停留时长（秒）
         # collision_pause_time: float = 0.8,
         # collision_pause_mode: str = "sleep",
     ):
@@ -94,7 +95,7 @@ class PandaObstacleEnv(gym.Env):
         
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32) # 归一化动作空间
         
-        # self.goal_position = np.array([0.4, 0.3, 0.4], dtype=np.float32)
+        # self.goal_position_base = np.array([0.4, -0.3, 0.4], dtype=np.float32)
         self.goal_position_base = np.array([0.0, 0.6, 0.5], dtype=np.float32) # 目标位置基准，y轴会随机变化
         self.goal_position = self.goal_position_base.copy()
         self.goal_arrival_threshold = 0.005 # 目标到达阈值，单位为米
@@ -117,6 +118,7 @@ class PandaObstacleEnv(gym.Env):
         # self.use_sim_time_for_timeout = use_sim_time_for_timeout
         self.max_episode_time = max_episode_time
         self.pause_on_collision = pause_on_collision
+        self.initial_pause_s = max(0.0, float(initial_pause_s))
         # self.collision_pause_time = collision_pause_time
         # self.collision_pause_mode = collision_pause_mode
 
@@ -203,6 +205,8 @@ class PandaObstacleEnv(gym.Env):
                 self.np_random.uniform(-0.3, -0.3),
                 self.np_random.uniform(-0.2, 0.2),
                 self.np_random.uniform(0.4, 0.55)
+                # group_center[0],
+                # self.np_random.uniform(-0.3, 0.3),
                 # group_center[1],
                 # group_center[2]
             ], dtype=np.float32)
@@ -253,6 +257,8 @@ class PandaObstacleEnv(gym.Env):
         
         if self.visualize:
             self._render_scene()
+            if self.initial_pause_s > 0:
+                time.sleep(self.initial_pause_s)
         
         self.last_action = self.data.qpos[:7].copy()
         obs = self._get_observation()
@@ -281,11 +287,14 @@ class PandaObstacleEnv(gym.Env):
         best = None
         best_dist = -np.inf
         for _ in range(max_attempts):
+            # 原始三维随机采样（保留注释，便于回退或对比）
             candidate = np.array([
                 self.np_random.uniform(-0.5, 0.5),
                 self.np_random.uniform(-0.7, 0.7),
                 self.np_random.uniform(0.2, 0.8),
             ], dtype=np.float32)
+            # candidate = self.goal_position_base.copy()
+            # candidate[1] = self.np_random.uniform(-0.3, 0.3)
             dist = self._min_distance_to_obstacles(candidate)
             if dist > best_dist:
                 best_dist = dist
@@ -516,6 +525,7 @@ class PandaObstacleEnv(gym.Env):
             if elapsed > self.max_episode_time:
                 reward -= 10.0
                 print(f"[超时] 时间过长，奖励减半")
+                print(f"[失败] 距离目标: {dist_to_goal:.3f}")
                 terminated = True
 
         if self.visualize and self.handle is not None:
@@ -680,15 +690,15 @@ def test_ppo(
 
 if __name__ == "__main__":
     TRAIN_MODE = False  # 设为True开启训练模式
-    OBSTACLE_TYPE = "box"  # 可选: sphere | box | cylinder
+    OBSTACLE_TYPE = "sphere"  # 可选: sphere | box | cylinder
     OBSTACLE_RANDOMIZE_POS = True  # 是否随机变化障碍物位置
-    RANDOMIZE_INIT_QPOS = True  # 是否随机机械臂初始位姿
+    RANDOMIZE_INIT_QPOS = False  # 是否随机机械臂初始位姿
     RANDOMIZE_GOAL_POS = True  # 是否随机目标位姿
     if TRAIN_MODE:
         import os 
         os.system("rm -rf /home/dar/mujoco-bin/mujoco-learning/tensorboard*")
     delete_flag_file()
-    MODEL_PATH = "assets/model/rl_obstacle_avoidance_checkpoint/panda_obstacle_avoidance_v3"
+    MODEL_PATH = "assets/model/rl_obstacle_avoidance_checkpoint/panda_obstacle_avoidance_v7"
     RESUME_MODEL_PATH = "assets/model/rl_obstacle_avoidance_checkpoint/panda_obstacle_avoidance_v2"
     if TRAIN_MODE:
         train_ppo(
@@ -706,7 +716,7 @@ if __name__ == "__main__":
     else:
         test_ppo(
             model_path=MODEL_PATH,
-            total_episodes=100, # 100
+            total_episodes=10, # 100
             obstacle_type=OBSTACLE_TYPE,
             obstacle_randomize_pos=OBSTACLE_RANDOMIZE_POS,
             randomize_init_qpos=RANDOMIZE_INIT_QPOS,
