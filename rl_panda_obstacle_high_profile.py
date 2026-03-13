@@ -160,6 +160,7 @@ class PandaObstacleEnv(gym.Env):
         
         num_obstacles = self.obstacle_positions.shape[0]
         size_dim = self.obstacle_sizes.shape[1]
+        # 需要改，输入观测改成相对值
         self.obs_size = 7 + 3 + (3 * num_obstacles) + (size_dim * num_obstacles) # 7轴关节角度+目标位置+每个障碍物位置+尺寸
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_size,), dtype=np.float32)
 
@@ -306,6 +307,7 @@ class PandaObstacleEnv(gym.Env):
         return best if best is not None else self.goal_position_base.copy()
 
     def _get_observation(self) -> np.ndarray: 
+        # 需要改，变成相对值
         joint_pos = self.data.qpos[:7].copy().astype(np.float32)
         self.obstacle_positions = self._get_obstacle_centers()
         self.obstacle_sizes = self._get_obstacle_sizes_obs()
@@ -421,6 +423,7 @@ class PandaObstacleEnv(gym.Env):
         return float(min_dist)
 
     def _calc_reward(self, joint_angles: np.ndarray, action: np.ndarray) -> tuple[np.ndarray, float]:
+        # 奖励函数改
         now_ee_pos = self.data.body(self.end_effector_id).xpos.copy()
         dist_to_goal = np.linalg.norm(now_ee_pos - self.goal_position)
 
@@ -690,15 +693,15 @@ def test_ppo(
 
 if __name__ == "__main__":
     TRAIN_MODE = False  # 设为True开启训练模式
-    OBSTACLE_TYPE = "sphere"  # 可选: sphere | box | cylinder
-    OBSTACLE_RANDOMIZE_POS = True  # 是否随机变化障碍物位置
+    OBSTACLE_TYPE = "box"  # 可选: sphere | box | cylinder
+    OBSTACLE_RANDOMIZE_POS = False  # 是否随机变化障碍物位置
     RANDOMIZE_INIT_QPOS = False  # 是否随机机械臂初始位姿
     RANDOMIZE_GOAL_POS = True  # 是否随机目标位姿
     if TRAIN_MODE:
         import os 
         os.system("rm -rf /home/dar/mujoco-bin/mujoco-learning/tensorboard*")
     delete_flag_file()
-    MODEL_PATH = "assets/model/rl_obstacle_avoidance_checkpoint/panda_obstacle_avoidance_v7"
+    MODEL_PATH = "assets/model/rl_obstacle_avoidance_checkpoint/panda_obstacle_avoidance_v3"
     RESUME_MODEL_PATH = "assets/model/rl_obstacle_avoidance_checkpoint/panda_obstacle_avoidance_v2"
     if TRAIN_MODE:
         train_ppo(
